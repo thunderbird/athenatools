@@ -3,19 +3,62 @@ import csv
 import StringIO
 import time
 
-from subprocess import check_output
+
+def s3_operate_objects(op, source_bucket, target_bucket='', prefix='', target_prefix='', delimiter='/'):
+    """
+    s3_operate_objects('cp', services-addons-logs', 'tmp', 'services-logs/EGX44RIFURRUW.2019', 'EGX44RIFURRUW.2019')
+    Copies or deletes objects in S3.
+    op must be 'copy' or 'delete'.
+    target_bucket required if copy.
+    """
+    if op == 'copy' and not target_bucket:
+        return False
+    s3 = boto3.client('s3')
+    continuing = True
+    token=''
+    while continuing:
+        if token:
+            r = s3.list_objects_v2(Bucket=source_bucket, Prefix=prefix, Delimiter=delimiter, ContinuationToken=token)
+        else:
+            r = s3.list_objects_v2(Bucket=source_bucket, Prefix=prefix, Delimiter=delimiter)
+        if 'NextContinuationToken' in r:
+            token = r['NextContinuationToken']
+            continuing = True
+        else:
+            continuing = False
+        if 'Contents' in r:
+            for obj in r['Contents']:
+                source_key = {'Bucket': source_bucket, 'Key': obj['Key']}
+                target_key = obj['Key']
+                # If we set a new target prefix, then replace the old one with it.
+                if target_prefix:
+                    target_key = obj['Key'].replace(prefix, target_prefix)
+                if op == 'copy':
+                    s3.copy_object(CopySource=source_key, Bucket=target_bucket, Key=target_key)
+                elif op == 'delete':
+                    s3.delete_object(Bucket=source_bucket, Key=obj['Key'])
+
+
+def s3_copy_objects(source_bucket, target_bucket='', prefix='', target_prefix='', delimiter='/'):
+    s3_operate_objects('copy', source_bucket, target_bucket, prefix, target_prefix, delimiter)
+
+
+# Prefix required to prevent accidental deletion of entire bucket.
+def s3_delete_objects(source_bucket, prefix, delimiter='/'):
+    s3_operate_objects('delete', source_bucket, prefix=prefix, delimiter=delimiter)
+
 
 class Athena(object):
     """
     Class to create AWS Athena queries and read the results.
     """
-    def __init__(self, database, data_bucket, result_bucket, timeout=300):
+    def __init__(self, database, data_location, result_bucket, timeout=300):
         self.database = database
         self.result_bucket = result_bucket
-        self.data_bucket = data_bucket
-        self.temp_bucket = result_bucket + '/tmp/'
+        self.data_location = data_location
         self.client = boto3.client('athena')
         self.timeout = timeout
+        self.table_name = ''
 
     def check_queries_state(self, query_ids):
         response = self.client.batch_get_query_execution(QueryExecutionIds=query_ids)
@@ -56,7 +99,7 @@ class Athena(object):
         return self.client.get_query_results(QueryExecutionId=qid)
 
     def create_table(self, query, name):
-        table_query = query.format(name, self.data_bucket)
+        table_query = query.format(name, self.data_location)
         state = self.start_query(table_query)
         response = self.wait_for_query([state['QueryExecutionId']])
         if response:
@@ -74,9 +117,8 @@ class Athena(object):
 
     def cleanup(self):
         print "Cleaning up temporary files and tables..."
-        # s3_cleanup_cmd = 'aws s3 rm s3://{0} --recursive'.format(self.temp_bucket)
-        # cleanup_debug = check_output(s3_cleanup_cmd, shell=True)
-        self.drop_table()
+        if self.table_name:
+            self.drop_table()
 
     def construct_json(self, csv):
         total = 0
@@ -90,22 +132,17 @@ class Athena(object):
         data["count"] = total
         return data
 
-    # Takes a list of {querytype: queryexecutionid} and copies files in s3.
-    def copy_results_s3(self, qid, filedir, filename):
-        result_filename = filename + '.json'
-        result_dir = filedir
-        s3 = boto3.resource('s3')
-        output_key = '/'.join([result_dir, result_filename])
-        rows = []
-        input_key = qid + '.csv'
 
-        infile = s3.Object(self.result_bucket,input_key)
-        data = infile.get()['Body'].read().splitlines(True)[1:]
-        outfile = StringIO.StringIO()
-        inreader = csv.reader(data)
-        jsondata = construct_json(inreader)
-        json.dump(jsondata, outfile)
-        outfile.seek(0)
-        s3.Object(self.data_bucket, output_key).put(Body=outfile)
-        infile.delete()
-        return True
+class AthenaLogs(Athena):
+    def __init__(self, database, data_bucket, result_bucket, log_prefix, timeout=300):
+        super(AthenaLogs, self).__init__(database, data_bucket, result_bucket, timeout)
+        self.data_bucket = data_bucket
+        self.log_prefix = log_prefix
+        self.temp_prefix = 'tmp/' + log_prefix
+        s3_copy_objects(self.data_bucket, self.data_bucket, log_prefix, self.temp_prefix)
+        self.data_location = self.data_bucket + '/' + self.temp_prefix.rsplit('/', 1)[0] + '/'
+
+    def cleanup(self):
+        super(AthenaLogs, self).cleanup()
+        s3_delete_objects(self.data_bucket, self.temp_prefix)
+
